@@ -14,9 +14,16 @@
 - **Полный маппинг заказа**: позиции (SKU, количество, цены с налогом, опции товара), суммы
   `grand_total`/`subtotal`/`shipping`/`tax`, способ оплаты и доставки, адрес, покупатель, `store_id`,
   комментарий покупателя — в `custom_fields`.
-- **Обратная синхронизация статусов**: REST-эндпоинт `POST /V1/tropatt/webhook` (`webapi.xml`, anonymous —
-  аутентификация по HMAC) проверяет подпись и окно ±300 с, меняет статус через
-  `OrderRepositoryInterface::save()` и **подавляет эхо** (`Model/Registry/EchoGuard.php`).
+- **Обратная синхронизация статусов**: фронтенд-контроллер `POST /tropatt/webhook/index`
+  (`Controller/Webhook/Index.php`, anonymous — аутентификация по HMAC подписи **сырого тела**) читает заголовки
+  `X-TropaTT-Signature`/`X-TropaTT-Timestamp` и проверяет подпись и окно ±300 с (`Model/InboundWebhook.php`),
+  затем меняет статус через `OrderRepositoryInterface::save()` и **подавляет эхо**
+  (`Model/Registry/EchoGuard.php`).
+
+  > **Почему контроллер, а не REST-эндпоинт:** сервис-контракт (`webapi.xml`) получает параметры только из
+  > тела/URL запроса, поэтому прежний `POST /V1/tropatt/webhook` не видел ни заголовков, ни сырого тела:
+  > Magento отвечал `InputException` (400) до входа в метод, а HMAC по десериализованному телу не совпал бы с
+  > подписью по сырому телу. Контроллер читает запрос целиком (`Request\Http::getHeader()/getContent()`).
 - **Остатки (MSI)**: `Model/StockSync.php` обновляет источники через **`SourceItemsSaveInterface`**
   (`SourceItemInterface`), команда `bin/magento tropatt:sync-stock <file.json> [source_code]`.
 - **Настройки в админке**: `Stores → Configuration → TropaTT CRM` (включение, URL шлюза, ключ/секрет витрины,
@@ -49,7 +56,9 @@
 4. Откройте **Stores → Configuration → TropaTT CRM**, включите модуль и заполните: URL шлюза, публичный ключ
    витрины (`stk_...`), секрет витрины, секрет вебхука, стадию CRM по умолчанию, маппинг статусов и код
    источника MSI (`default`).
-5. Укажите URL вебхука в карточке витрины в TropaTT CRM: `https://shop.example.com/rest/V1/tropatt/webhook`.
+5. Укажите URL вебхука в карточке витрины в TropaTT CRM: `https://shop.example.com/tropatt/webhook/index`.
+   При обновлении с версии ниже 1.0.2 замените прежний URL `https://shop.example.com/rest/V1/tropatt/webhook`
+   (этот REST-маршрут удалён: он не мог проверить подпись и всегда отвечал 400).
 
 ## 4. Схема обмена
 
@@ -61,7 +70,7 @@
                                                           ▼
                             POST /_module/crm.ecommerce-gateway/v1/orders (HMAC-SHA256)
                                                           │
-  POST /rest/V1/tropatt/webhook ◄── order.status_changed ─┘  CRM Events / Outbox
+  POST /tropatt/webhook/index ◄── order.status_changed ─┘  CRM Events / Outbox
         │  подпись base64(HMAC(secret, timestamp.'.'.body)), окно ±300 c
         ▼
   OrderRepositoryInterface::save()  (anti-echo: EchoGuard)
@@ -100,8 +109,8 @@ bash build.sh   # dist/tropatt-magento.zip
 |---|---|
 | Заказы не уходят в CRM | Модуль включён, настройки заполнены, консьюмер `tropattOrderSync` запущен, RabbitMQ доступен |
 | Сообщения копятся в очереди | Проверьте логи консьюмера (`var/log/`), доступность URL шлюза и правильность ключа/секрета |
-| Вебхук отвечает 401 | `webhook_secret` в настройках должен совпадать с секретом витрины в CRM; проверьте время сервера (±300 с) |
-| Вебхук отвечает 404 | Заказ не найден по `external_order_id` |
+| Вебхук отвечает 401 | `webhook_secret` в настройках должен совпадать с секретом витрины в CRM; проверьте время сервера (±300 с) и что запрос отправлен методом POST на `/tropatt/webhook/index` |
+| Вебхук отвечает 404 | Заказ не найден по `external_order_id` (или запрос пришёл не методом POST — роутер отдаёт 404) |
 | Вебхук отвечает 422 | В маппинге нет пары для стадии CRM либо указан несуществующий статус Magento |
 | Остатки не обновляются | Проверьте код источника MSI и наличие SKU; запустите `bin/magento tropatt:sync-stock` вручную |
 
@@ -115,7 +124,8 @@ AGPL-3.0, та же лицензия, что и у проекта TropaTT (см.
 
 The `Tropatt_Crm` module connects Magento 2 with the TropaTT CRM e-commerce gateway. Order saves are published
 to the Message Queue (`tropatt.order.sync`) by an interceptor on `OrderRepositoryInterface`, and the consumer
-delivers the canonical payload with HMAC-SHA256 signing. The CRM webhook (`POST /V1/tropatt/webhook`) applies
+delivers the canonical payload with HMAC-SHA256 signing. The CRM webhook (`POST /tropatt/webhook/index`, a
+frontend controller that reads the `X-TropaTT-Signature`/`X-TropaTT-Timestamp` headers and the raw body) applies
 status changes with echo suppression, and stock is pushed through the Multi-Source Inventory API
 (`SourceItemsSaveInterface`) from `bin/magento tropatt:sync-stock`.
 
@@ -125,7 +135,8 @@ status changes with echo suppression, and stock is pushed through the Multi-Sour
 2. `bin/magento module:enable Tropatt_Crm && bin/magento setup:upgrade && bin/magento setup:di:compile && bin/magento cache:flush`.
 3. Start the consumer: `bin/magento queue:consumers:start tropattOrderSync`.
 4. Configure **Stores → Configuration → TropaTT CRM** and point the store webhook at
-   `https://shop.example.com/rest/V1/tropatt/webhook`.
+   `https://shop.example.com/tropatt/webhook/index` (upgrading from a build below 1.0.2: replace the removed
+   `https://shop.example.com/rest/V1/tropatt/webhook`, which could not verify the signature and always answered 400).
 
 ## License
 

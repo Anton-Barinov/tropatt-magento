@@ -6,8 +6,6 @@
         <plugin name="tropatt_order_save" type="Tropatt\Crm\Plugin\OrderPlugin"/>
     </type>
 
-    <preference for="Tropatt\Crm\Api\WebhookInterface" type="Tropatt\Crm\Model\Webhook"/>
-
     <type name="Tropatt\Crm\Model\Queue\Consumer">
         <arguments>
             <argument name="client" xsi:type="object">Tropatt\Crm\Model\Http\Client</argument>

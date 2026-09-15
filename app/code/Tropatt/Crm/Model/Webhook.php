@@ -4,19 +4,22 @@ namespace Tropatt\Crm\Model;
 
 use Magento\Sales\Api\OrderRepositoryInterface;
 use Psr\Log\LoggerInterface;
-use Tropatt\Crm\Api\WebhookInterface;
 use Tropatt\Crm\Model\Registry\EchoGuard;
 
 /**
- * Inbound CRM webhook: verifies the signature and applies the mapped status.
+ * Applies a verified CRM status change to the order.
+ *
+ * The HTTP entry point is `Controller\Webhook\Index` (a service contract cannot
+ * expose headers or the raw body); this class owns the verification hand-off, the
+ * status resolution and the anti-echo save.
  */
-class Webhook implements WebhookInterface
+class Webhook
 {
     /** @var Config */
     private $config;
 
-    /** @var Signature */
-    private $signature;
+    /** @var InboundWebhook */
+    private $inbound;
 
     /** @var OrderRepositoryInterface */
     private $orderRepository;
@@ -29,90 +32,92 @@ class Webhook implements WebhookInterface
 
     public function __construct(
         Config $config,
-        Signature $signature,
+        InboundWebhook $inbound,
         OrderRepositoryInterface $orderRepository,
         EchoGuard $echoGuard,
         LoggerInterface $logger
     ) {
         $this->config = $config;
-        $this->signature = $signature;
+        $this->inbound = $inbound;
         $this->orderRepository = $orderRepository;
         $this->echoGuard = $echoGuard;
         $this->logger = $logger;
     }
 
     /**
-     * @return string
+     * Verify the signed CRM packet and apply the mapped order status.
+     *
+     * @param string $rawBody
+     * @param string $signature
+     * @param string $timestamp
+     * @return array{http_code:int, body:array}
      */
-    public function execute($payload, $signature = '', $timestamp = '')
+    public function handle($rawBody, $signature, $timestamp)
     {
-        $secret = $this->config->webhookSecret();
+        $packet = $this->inbound->parse($rawBody, $signature, $timestamp, $this->config->webhookSecret());
 
-        if ($secret === '' || $signature === '' || $timestamp === '') {
-            return $this->json(401, ['error' => 'Missing authentication headers']);
+        if (!$packet['ok']) {
+            return array(
+                'http_code' => $packet['http_code'],
+                'body' => array('error' => $packet['error']),
+            );
         }
 
-        if (!$this->signature->withinTolerance($timestamp)) {
-            return $this->json(401, ['error' => 'Timestamp out of tolerance window']);
-        }
+        $data = $packet['data'];
+        $orderId = (int)$packet['external_order_id'];
+        $crmStage = isset($data['new_status']) ? (string)$data['new_status'] : '';
 
-        if (!$this->signature->verifyWebhook($timestamp, (string)$payload, (string)$signature, $secret)) {
-            return $this->json(401, ['error' => 'Invalid cryptographic signature']);
+        if (!empty($data['external_status'])) {
+            $status = (string)$data['external_status'];
+        } else {
+            $status = StatusMapper::magentoStatusFor($this->config->statusMapping(), $crmStage);
         }
-
-        $data = json_decode((string)$payload, true);
-        if (!is_array($data)) {
-            return $this->json(400, ['error' => 'Invalid JSON payload']);
-        }
-
-        $orderId = (int)($data['external_order_id'] ?? 0);
-        if ($orderId <= 0) {
-            return $this->json(422, ['error' => 'Missing external_order_id']);
-        }
-
-        $status = !empty($data['external_status'])
-            ? (string)$data['external_status']
-            : StatusMapper::magentoStatusFor($this->config->statusMapping(), (string)($data['new_status'] ?? ''));
 
         if ($status === null || $status === '') {
-            return $this->json(200, ['success' => true, 'notice' => 'Ignored: no mapping for status']);
+            return array(
+                'http_code' => 200,
+                'body' => array('success' => true, 'notice' => 'Ignored: no mapping for status'),
+            );
         }
 
         try {
             $order = $this->orderRepository->get($orderId);
         } catch (\Throwable $exception) {
-            return $this->json(404, ['error' => 'Order not found: ' . $orderId]);
+            return array(
+                'http_code' => 404,
+                'body' => array('error' => 'Order not found: ' . $orderId),
+            );
         }
 
-        // Anti-echo: the save below must not publish an order event back to the CRM.
+        // Anti-echo: the save below must not publish the same change back to the CRM.
         $this->echoGuard->suppress(true);
 
         try {
             $order->setStatus($status);
             $this->orderRepository->save($order);
         } catch (\Throwable $exception) {
-            $this->logger->error('TropaTT CRM: failed to apply the order status', [
+            $this->logger->error('TropaTT CRM: failed to apply the order status', array(
                 'order_id' => $orderId,
                 'status' => $status,
                 'error' => $exception->getMessage(),
-            ]);
+            ));
             $this->echoGuard->suppress(false);
 
-            return $this->json(500, ['error' => 'Failed to apply the status']);
+            return array(
+                'http_code' => 500,
+                'body' => array('error' => 'Failed to apply the status'),
+            );
         }
 
         $this->echoGuard->suppress(false);
 
-        return $this->json(200, ['success' => true, 'order_id' => $orderId, 'new_status' => $status]);
-    }
-
-    /**
-     * @return string
-     */
-    private function json($status, array $payload)
-    {
-        http_response_code($status);
-
-        return (string)json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        return array(
+            'http_code' => 200,
+            'body' => array(
+                'success' => true,
+                'order_id' => $orderId,
+                'new_status' => $status,
+            ),
+        );
     }
 }

@@ -57,7 +57,7 @@ jobs:
           import xml.etree.ElementTree as ET
 
           for path in ('app/code/Tropatt/Crm/etc/module.xml', 'app/code/Tropatt/Crm/etc/di.xml',
-                       'app/code/Tropatt/Crm/etc/webapi.xml', 'app/code/Tropatt/Crm/etc/communication.xml',
+                       'app/code/Tropatt/Crm/etc/frontend/routes.xml', 'app/code/Tropatt/Crm/etc/communication.xml',
                        'app/code/Tropatt/Crm/etc/queue_consumer.xml', 'app/code/Tropatt/Crm/etc/queue_topology.xml',
                        'app/code/Tropatt/Crm/etc/adminhtml/system.xml', 'app/code/Tropatt/Crm/etc/config.xml'):
               ET.parse(path)
@@ -65,8 +65,16 @@ jobs:
           PY
           grep -q "Tropatt_Crm" app/code/Tropatt/Crm/etc/module.xml
           grep -q "OrderRepositoryInterface" app/code/Tropatt/Crm/etc/di.xml
-          grep -q "/V1/tropatt/webhook" app/code/Tropatt/Crm/etc/webapi.xml
           grep -q "tropatt.order.sync" app/code/Tropatt/Crm/etc/communication.xml
           grep -q "SourceItemsSaveInterface" app/code/Tropatt/Crm/Model/StockSync.php
           grep -q "EchoGuard" app/code/Tropatt/Crm/Model/Webhook.php
+          # The webhook receiver is a POST-only frontend controller. It must never go back
+          # to the webapi service contract: that route cannot see the signature headers or
+          # the raw body the CRM signs, so every delivery failed with an InputException.
+          test ! -e app/code/Tropatt/Crm/etc/webapi.xml
+          test ! -e app/code/Tropatt/Crm/Api/WebhookInterface.php
+          grep -q 'frontName="tropatt"' app/code/Tropatt/Crm/etc/frontend/routes.xml
+          grep -q "HttpPostActionInterface" app/code/Tropatt/Crm/Controller/Webhook/Index.php
+          grep -q "getContent" app/code/Tropatt/Crm/Controller/Webhook/Index.php
+          grep -q "X-TropaTT-Signature" app/code/Tropatt/Crm/Model/InboundWebhook.php
           echo "module manifest is complete"

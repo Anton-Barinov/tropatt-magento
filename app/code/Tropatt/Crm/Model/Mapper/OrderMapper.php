@@ -51,7 +51,7 @@ class OrderMapper
                 'email' => (string)$order->getCustomerEmail(),
             ],
             'shipping_method' => (string)$order->getShippingDescription(),
-            'payment_method' => (string)$order->getPayment()?->getMethod(),
+            'payment_method' => $this->paymentMethod($order),
             'address' => $address === null ? [] : [
                 'city' => (string)$address->getCity(),
                 'street' => trim(implode(' ', (array)$address->getStreet())),
@@ -136,6 +136,18 @@ class OrderMapper
                 'custom_fields' => $customFields,
             ],
         ];
+    }
+
+    /**
+     * Payment method title (PHP 7.4 compatible: no nullsafe operator).
+     *
+     * @return string
+     */
+    private function paymentMethod($order)
+    {
+        $payment = $order->getPayment();
+
+        return $payment !== null ? (string)$payment->getMethod() : '';
     }
 
     /**
